@@ -54602,7 +54602,7 @@ function explodeAtMaxZoom(clusters, currentK, kMax) {
   return result;
 }
 
-function annotateClusterYears(clusters) {
+function annotateClusterSpans(clusters) {
   clusters.forEach((c) => {
     let minT = Infinity, maxT = -Infinity;
     for (const d of c.items) {
@@ -54611,8 +54611,8 @@ function annotateClusterYears(clusters) {
       if (s < minT) minT = s;
       if (e > maxT) maxT = e;
     }
-    c.displayStartYear = new Date(minT).getFullYear();
-    c.displayEndYear = new Date(maxT).getFullYear();
+    c.minT = minT;
+    c.maxT = maxT;
   });
 }
 
@@ -54714,7 +54714,7 @@ function build() {
       }
       return false;
     });
-    annotateClusterYears(clusters);
+    annotateClusterSpans(clusters);
 
     tooltipEl.style.display = "none";
     markersG.selectAll("*").remove();
@@ -54901,24 +54901,30 @@ function build() {
   }
 
   function showTooltip(c, event) {
-    const items = c.items.length === 1
-      ? c.items
-      : c.items.slice().sort((a, b) => a.date - b.date);
-    if (items.length === 1) {
-      const d = items[0];
+    tooltipEl.style.maxWidth = "";
+    if (c.items.length === 1) {
+      const d = c.items[0];
       const note = d.isRange ? `<div style="opacity:.7;font-size:11px">estimated date</div>` : "";
       tooltipEl.innerHTML = `<div class="tt-date">${formatEntryDate(d)}</div>${note}<div>${d.title}</div>`;
     } else {
-      const range =
-        c.displayStartYear === c.displayEndYear
-          ? `${c.displayStartYear}`
-          : `${c.displayStartYear}\u2013${c.displayEndYear}`;
-      const preview = items
-        .slice(0, 5)
-        .map((d) => `${formatEntryDate(d)}${d.isRange ? " (est.)" : ""}: ${d.title}`)
-        .join("<br/>");
-      const more = items.length > 5 ? `<br/>+${items.length - 5} more` : "";
-      tooltipEl.innerHTML = `<div class="tt-date">${range} \u00b7 ${items.length} entries</div><div>${preview}${more}</div>`;
+      const counts = new Map();
+      for (const d of c.items) {
+        const source = d.title.split(",")[0];
+        counts.set(source, (counts.get(source) || 0) + 1);
+      }
+      const sources = [...counts.keys()].sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
+      const cardRect = card.getBoundingClientRect();
+      const maxCols = Math.max(1, Math.floor((cardRect.width - 24) / 112));
+      const cols = Math.min(maxCols, Math.max(1, Math.ceil(sources.length / 12)));
+      const rows = Math.ceil(sources.length / cols);
+      const span = formatEntryDate({ isRange: c.maxT > c.minT, date: new Date(c.minT), endDate: new Date(c.maxT) });
+      const list = sources
+        .map((src) => `<div>${src} <span style="opacity:.6">(${counts.get(src)})</span></div>`)
+        .join("");
+      if (cols > 1) tooltipEl.style.maxWidth = cardRect.width - 12 + "px";
+      tooltipEl.innerHTML =
+        `<div class="tt-date">${span} \u00b7 ${c.items.length} entries \u00b7 ${sources.length} Ms/Ts</div>` +
+        `<div style="display:grid;grid-auto-flow:column;grid-template-rows:repeat(${rows},auto);column-gap:14px;white-space:nowrap">${list}</div>`;
     }
     tooltipEl.style.display = "block";
     positionTooltip(event);
@@ -54926,9 +54932,13 @@ function build() {
 
   function positionTooltip(event) {
     const cardRect = card.getBoundingClientRect();
+    tooltipEl.style.left = "0px";
+    const w = tooltipEl.offsetWidth;
+    const h = tooltipEl.offsetHeight;
     let left = event.clientX - cardRect.left + 14;
     let top = event.clientY - cardRect.top - 40;
-    left = Math.min(Math.max(left, 6), cardRect.width - 210);
+    left = Math.min(Math.max(left, 6), Math.max(6, cardRect.width - w - 6));
+    top = Math.min(Math.max(top, 6), Math.max(6, cardRect.height - h - 6));
     tooltipEl.style.left = left + "px";
     tooltipEl.style.top = top + "px";
   }
