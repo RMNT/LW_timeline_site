@@ -54305,10 +54305,23 @@ const RAW_DATA = [
   {"date": "1951-04-27", "end": null, "title": "Ms-177,9r[3]et9v[1]et10r[1]", "link": "https://wab.uib.no/nachlass/bemerkung/Ms-177%2C9r%5B3%5Det9v%5B1%5Det10r%5B1%5D_linear.html"},
 ];
 
+// RAW_DATA is prepended above this code by generate_js.py, which writes the
+// combined result to static/timeline_data.js. Each entry:
+//   { "date": "YYYY-MM-DD", "end": "YYYY-MM-DD" | null, "title": ..., "link": ... }
+// `end: null` means an exact date; otherwise the entry is an estimate
+// spanning date..end.
 
 const STEM_MIN = 34;
 const STEM_MAX = 298;
 
+// Line height reflects how many entries a marker represents — but as a
+// continuous log scale, not fixed buckets. A log scale (rather than
+// linear) matters here because counts can span orders of magnitude in
+// the same view (single digits up to thousands); linear would make
+// everything except the very largest cluster look flat/tiny by
+// comparison. The scale's domain is rebuilt each render from whichever
+// clusters are actually on screen, so height reflects a marker's size
+// *relative to what's currently visible* rather than a fixed global cap.
 function computeHeightScale(clusters) {
   const maxCount = d3.max(clusters, (c) => c.items.length) || 1;
   return d3.scaleLog()
@@ -54317,6 +54330,12 @@ function computeHeightScale(clusters) {
     .clamp(true);
 }
 
+// `date` is the start (or the exact date), `endDate` is null for exact
+// entries. `mid` is what positioning, sorting and clustering are based on:
+// the date itself for exact entries, the midpoint of the range otherwise.
+// "YYYY-MM-DD" -> local midnight. (new Date("YYYY-MM-DD") means UTC
+// midnight, which the local-time formatting below would show as the
+// previous day in any timezone west of UTC.)
 function parseISODate(s) {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, m - 1, d);
@@ -54332,6 +54351,12 @@ const DATA = RAW_DATA
   })
   .sort((a, b) => a.mid - b.mid);
 
+// Entries sharing the exact same date have zero pixel distance no matter
+// how far you zoom, so they can never separate by date alone. Give
+// same-date duplicates a tiny synthetic time offset (a few hours apart)
+// to plot by, so a deep enough zoom can still pull them apart. This only
+// affects `plotDate` (used for x-position/clustering) — the true `date`
+// is kept untouched for labels and tooltips.
 const dateGroups = new Map();
 DATA.forEach((d) => {
   const key = d.mid.getTime();
@@ -54339,6 +54364,10 @@ DATA.forEach((d) => {
   dateGroups.get(key).push(d);
 });
 dateGroups.forEach((group) => {
+  // Sort same-date entries alphabetically by title, so the jitter offsets
+  // below place them left to right in that order. `numeric: true` compares
+  // digit runs as numbers, so [2] comes before [10] and page 73 before
+  // page 189 (plain string order would put them the other way round).
   group.sort((a, b) => a.title.localeCompare(b.title, "en", { numeric: true }));
   group.forEach((d, i) => {
     d.plotDate = new Date(d.mid.getTime() + i * 1000 * 60 * 60 * 4);
@@ -54346,17 +54375,37 @@ dateGroups.forEach((group) => {
   });
 });
 
+// The jitter above can, for dates with many duplicates, push a plotDate
+// past a neighboring real date that's only a day or two later — which
+// would leave DATA (still sorted by the original `date`) out of step
+// with the x-positions everything else uses. Re-sorting by plotDate here
+// keeps array order and on-screen left-to-right order consistent again.
 DATA.sort((a, b) => a.plotDate - b.plotDate);
 
-const filterState = { exact: true, range: true };
+// Which kinds of entry are currently shown. `activeData` is DATA filtered
+// accordingly (still sorted by plot time, so the clustering sweep works on
+// it unchanged). The axis domain deliberately keeps using ALL of DATA, so
+// toggling a filter never rescales the view.
+const filterState = { exact: true, range: true, ms: true, ts: true };
 let activeData = DATA;
 function applyFilter() {
-  activeData = DATA.filter((d) => (d.isRange ? filterState.range : filterState.exact));
+  activeData = DATA.filter((d) => {
+    if (!(d.isRange ? filterState.range : filterState.exact)) return false;
+    const cat = categoryOf(d.title);
+    // A title with neither prefix (shouldn't happen) is never hidden by
+    // the Ms/Ts boxes.
+    return cat === "ms" ? filterState.ms : cat === "ts" ? filterState.ts : true;
+  });
 }
 
 const MARKER_COLOR = "#3E6259";
 const LABEL_COLOR = "#2A4640";
 
+// Color by document category, parsed from each title's "Ms-"/"Ts-" prefix.
+// A cluster that's entirely one category gets that category's color; a
+// cluster mixing both gets a third, distinct color — that way the color
+// itself signals "homogeneous" vs "mixed" content without needing to
+// hover to find out.
 const CATEGORY_COLORS = {
   ms: "#3E6259",     // manuscripts — same teal as before, so pure-Ms
                       // clusters look unchanged from the prior version
@@ -54384,6 +54433,8 @@ const AXIS_GUTTER = 40;
 const OVERVIEW_HEIGHT = 46;
 const OVERVIEW_MARGIN_TOP = 14;
 const CLUSTER_PX = 5;
+// Extra clear space (px) kept between two neighbouring markers, on top of
+// their drawn radii, before they are merged into one (see groupRanges).
 const MARKER_PAD = 3;
 const CLIP_PAD_X = 70;
 const CLIP_PAD_Y = 90;
@@ -54392,6 +54443,9 @@ const card = document.getElementById("card");
 const tooltipEl = document.getElementById("tooltip");
 const svg = d3.select("#chart");
 
+// Populate the color legend, if the page has a #legend container. Guarded
+// with the null check so this doesn't throw on a page that hasn't added
+// the container yet — see the HTML/CSS this expects, below.
 const LEGEND_LABELS = {
   ms: "Manuscript (Ms)",
   ts: "Typescript (Ts)",
@@ -54407,15 +54461,23 @@ if (legendEl) {
   });
 }
 
+// ---- exact / estimated filter ----
+// Four checkboxes in two pairs: exact dates (circles) / estimated dates
+// (diamonds with a range bar), and manuscripts (Ms) / typescripts (Ts). Both
+// boxes of a pair checked shows everything; one checked shows only that kind. They double as the legend for the two marker shapes. Built
+// here, once (not inside build()), so a window resize doesn't duplicate
+// them; build() points onFilterChange at the live renderers.
 const nExact = DATA.filter((d) => !d.isRange).length;
 const nRange = DATA.length - nExact;
+const nMs = DATA.filter((d) => categoryOf(d.title) === "ms").length;
+const nTs = DATA.filter((d) => categoryOf(d.title) === "ts").length;
 
 const filtersEl = document.createElement("div");
 filtersEl.style.cssText =
   "display:flex;align-items:center;flex-wrap:wrap;gap:6px 18px;margin:0 0 6px;" +
   "font:12px system-ui,sans-serif;color:#5F5E5A;";
 
-function makeFilterBox(key, shapeCss, label, count) {
+function makeFilterBox(key, partner, shapeCss, label, count, color = "#8A8877") {
   const wrap = document.createElement("label");
   wrap.style.cssText = "display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;";
 
@@ -54426,7 +54488,7 @@ function makeFilterBox(key, shapeCss, label, count) {
   wrap.appendChild(box);
 
   const shape = document.createElement("span");
-  shape.style.cssText = `width:8px;height:8px;display:inline-block;background:#8A8877;${shapeCss}`;
+  shape.style.cssText = `width:8px;height:8px;display:inline-block;background:${color};${shapeCss}`;
   wrap.appendChild(shape);
 
   const text = document.createElement("span");
@@ -54435,8 +54497,9 @@ function makeFilterBox(key, shapeCss, label, count) {
 
   box.addEventListener("change", () => {
     filterState[key] = box.checked;
-    // Never let both be off: there'd be nothing left to show.
-    if (!filterState.exact && !filterState.range) {
+    // Never let a pair (exact/estimated, Ms/Ts) both be off: there'd be
+    // nothing left to show.
+    if (!filterState[key] && !filterState[partner]) {
       filterState[key] = true;
       box.checked = true;
       return;
@@ -54447,8 +54510,10 @@ function makeFilterBox(key, shapeCss, label, count) {
   return wrap;
 }
 
-filtersEl.appendChild(makeFilterBox("exact", "border-radius:50%;", "Exact date", nExact));
-filtersEl.appendChild(makeFilterBox("range", "transform:rotate(45deg) scale(0.9);", "Estimated date (diamond + range bar)", nRange));
+filtersEl.appendChild(makeFilterBox("exact", "range", "border-radius:50%;", "Exact date", nExact));
+filtersEl.appendChild(makeFilterBox("range", "exact", "transform:rotate(45deg) scale(0.9);", "Estimated date (diamond + range bar)", nRange));
+filtersEl.appendChild(makeFilterBox("ms", "ts", "border-radius:50%;", "Manuscript (Ms)", nMs, CATEGORY_COLORS.ms));
+filtersEl.appendChild(makeFilterBox("ts", "ms", "border-radius:50%;", "Typescript (Ts)", nTs, CATEGORY_COLORS.ts));
 
 const chartEl = document.getElementById("chart");
 if (chartEl && chartEl.parentNode === card) card.insertBefore(filtersEl, chartEl);
@@ -54465,6 +54530,10 @@ function isLastOfMonth(d) {
   return next.getDate() === 1;
 }
 
+// Text for an entry's date. Exact entries show one day; estimates show the
+// range at the precision the bounds themselves imply — whole months
+// collapse to "Jul – Aug 1918", a whole year to "1904" — instead of
+// spelling out days that would suggest false precision.
 function formatEntryDate(d) {
   if (!d.isRange) return fmtDayYear(d.date);
   const s = d.date, e = d.endDate;
@@ -54482,6 +54551,9 @@ function formatEntryDate(d) {
     : `${fmtDayYear(s)} \u2013 ${fmtDayYear(e)}`;
 }
 
+// Pure string logic, no DOM — used both to decide what a label's lines
+// will be, and (via measureLabelWidth below) how wide it'll render,
+// without needing to touch the DOM to find out.
 function computeLabelLines(text, maxCharsPerLine) {
   const words = text.split(/\s+/);
   const lines = [];
@@ -54499,6 +54571,7 @@ function computeLabelLines(text, maxCharsPerLine) {
   return lines;
 }
 
+// Writes precomputed lines into an existing <text> selection as <tspan>s.
 function applyLabelLines(textSel, lines, lineHeight, baseY, up) {
   textSel.selectAll("tspan").remove();
   const n = lines.length;
@@ -54511,6 +54584,12 @@ function applyLabelLines(textSel, lines, lineHeight, baseY, up) {
   });
 }
 
+// getBBox() forces a synchronous layout reflow every time it's called —
+// doing that for every label on every zoom/pan tick is what was choking
+// the browser. An off-screen canvas's measureText() gives the same
+// number (how wide this text renders) without ever touching the live
+// DOM or forcing layout, so it's essentially free by comparison. This
+// has to be kept in sync with text.label's actual font (size, family).
 const LABEL_FONT = "11.5px Georgia, 'Iowan Old Style', serif";
 const measureCanvas = document.createElement("canvas");
 const measureCtx = measureCanvas.getContext("2d");
@@ -54528,6 +54607,12 @@ let width = card.clientWidth - 36;
 let innerWidth = Math.max(width - MARGIN.left - MARGIN.right, 100);
 let innerHeight = HEIGHT - MARGIN.top - MARGIN.bottom;
 
+// Groups points whose screen x-positions (under the current zoom scale zx)
+// fall within CLUSTER_PX pixels of the previous point into one cluster.
+// DATA is date-sorted, so a single left-to-right sweep is enough.
+// A time scale is linear, so time -> pixel can be computed with plain
+// arithmetic instead of calling the scale (and building Date objects) for
+// every one of ~54,000 entries on every zoom tick.
 function linearX(zx) {
   const [d0, d1] = zx.domain();
   const [r0, r1] = zx.range();
@@ -54536,10 +54621,22 @@ function linearX(zx) {
   return (t) => r0 + (t - t0) * k;
 }
 
+// The radius a marker is drawn with: a numbered circle grows with its
+// count (up to 15), a single estimated entry is a diamond (half-diagonal
+// 7), a single exact entry a dot (5).
 function markerRadius(count, isRange) {
   return count > 1 ? Math.min(6 + Math.sqrt(count) * 2, 15) : (isRange ? 7 : 5);
 }
 
+// Groups `list` (entries sorted by plot time) for a given time -> pixel
+// function, in two steps:
+//   1. consecutive entries within CLUSTER_PX of the previous one share a group;
+//   2. neighbouring groups whose markers would overlap (centres closer than
+//      their two radii plus MARKER_PAD) are merged into one, so no two
+//      markers are ever drawn on top of each other.
+// Step 2 works left to right with a stack, so a merge that makes a bigger
+// marker is checked against the one before it again. A group is an index
+// range [lo, hi) into `list` with its mean x, which keeps this cheap.
 function groupRanges(list, toX) {
   const groups = [];
   let cur = null;
@@ -54584,6 +54681,14 @@ function clusterPoints(zx) {
 
 const FAN_SPACING = 14; // px between fanned-out items, once even max zoom can't separate them by real time
 
+// Two entries can, in principle, have real timestamps so close together
+// that no amount of zooming pulls them past CLUSTER_PX apart — the zoom
+// scale has a hard ceiling (kMax), and real-time distance times a finite
+// k is still finite. Once that ceiling is reached, this stops relying on
+// real-time distance entirely and instead fans out any still-merged
+// cluster evenly in screen space, so every item ends up individually
+// visible and clickable. Left-to-right order still matches chronological
+// order — only exact spacing stops being time-proportional at this point.
 function explodeAtMaxZoom(clusters, currentK, kMax) {
   if (currentK < kMax) return clusters;
   const result = [];
@@ -54602,8 +54707,20 @@ function explodeAtMaxZoom(clusters, currentK, kMax) {
   return result;
 }
 
+// Clusters are built left-to-right in date order, so real start/end years
+// can't actually overlap between neighbors — but since the tooltip only
+// shows year precision, two adjacent clusters can still each display the
+// same boundary year (e.g. one ending "...1656" and the next starting
+// "1656..." for genuinely different months within that year). This walks
+// the clusters in order and bumps a cluster's *displayed* start year by
+// one whenever it matches the previous cluster's displayed end year, so
+// the labels themselves never repeat a year at a shared edge. Only the
+// display fields are touched — the actual dates/items are untouched.
 function annotateClusterYears(clusters) {
   clusters.forEach((c) => {
+    // One pass: earliest start and latest end (for ranges, the end date;
+    // for exact entries, the date itself). Items are ordered by midpoint,
+    // so neither the first nor the last item is guaranteed to hold them.
     let minT = Infinity, maxT = -Infinity;
     for (const d of c.items) {
       const s = d.date.getTime();
@@ -54620,9 +54737,29 @@ let zoomBehavior, brush, brushSel, xScale, currentXScale;
 let suppressBrush = false;
 let suppressZoom = false;
 
+// Set by build() to redraw the markers and overview after the exact/
+// estimated checkboxes change. A no-op until the first build() runs.
 let onFilterChange = () => {};
 
+// The zoom behavior is attached to `main`, a <g> local to build() — but
+// clusterPoints (below) is defined outside build() and has no access to
+// it, so d3.zoomTransform(mainNode) isn't reachable from there. Tracking
+// the transform directly here (updated at the top of zoomed(), and reset
+// at the start of each build()) avoids needing DOM lookups at all.
 let currentTransform = d3.zoomIdentity;
+
+// D3's zoom transitions don't interpolate scale in a straight line
+// between start and end — they use a "zoom out, pan, zoom in" camera
+// swoop (interpolateZoom), which deliberately dips to a much SMALLER
+// scale partway through a long transition, even when going from one
+// zoomed-in view to another. If a second click starts a new zoom
+// calculation while a previous one is still mid-flight, reading the live
+// currentTransform can catch it right at that dip — producing a wildly
+// wrong "current zoom level" for that instant. targetTransform tracks
+// the actual INTENDED destination of the most recently started
+// transition (set the moment it's kicked off, not updated by the swoop),
+// so "don't zoom out past where you are" logic has something stable to
+// compare against regardless of what's mid-animation.
 let targetTransform = d3.zoomIdentity;
 
 function build() {
@@ -54634,10 +54771,19 @@ function build() {
     .attr("height", HEIGHT + OVERVIEW_MARGIN_TOP + OVERVIEW_HEIGHT)
     .style("font-family", "Georgia, 'Iowan Old Style', serif");
 
+  // The domain covers the true extent of every entry — for estimates that
+  // means their start and end, not just the midpoint — so a range bar at
+  // either end of the data isn't cut off by the edge of the axis.
   const domainMin = d3.min(DATA, d => Math.min(d.plotDate.getTime(), d.date.getTime()));
+  // (No `|| 0` fallback here: 0 is 1970-01-01, which is LATER than every
+  // date in this data, so it would stretch the axis out to 1970.)
   const domainMax = d3.max(DATA, d => d.endDate
     ? Math.max(d.plotDate.getTime(), d.endDate.getTime())
     : d.plotDate.getTime());
+  // Pad the window so the first page opens with some empty space before
+  // the first entry and after the last one, instead of the data touching
+  // the edges. DOMAIN_PAD is a fraction of the full span, added on each
+  // side (0.03 on ~38 years is about 1 year). Raise it for more space.
   const DOMAIN_PAD = 0.03;
   const domainSpan = domainMax - domainMin;
   xScale = d3.scaleTime()
@@ -54685,6 +54831,12 @@ function build() {
       .call(g => g.selectAll(".tick line").attr("stroke", "#C9CDD1"))
       .call(g => g.selectAll(".tick text").attr("fill", "#3D4145").attr("font-size", 12));
 
+    // Safety net: at extreme zoom the visible range can be narrower than a
+    // single day (a couple of hours at the maximum zoom), so no midnight
+    // falls inside it and the axis would render with no ticks at all. If
+    // that happens, force exactly one tick, labeled with the date of the
+    // domain's midpoint (no time of day), so there's always at least one
+    // time reference visible, however deep you zoom.
     if (axisG.selectAll(".tick").empty()) {
       const mid = new Date((zx.domain()[0].getTime() + zx.domain()[1].getTime()) / 2);
       const g = axisG.append("g").attr("class", "tick")
@@ -54700,8 +54852,16 @@ function build() {
     const baselineY = innerHeight - AXIS_GUTTER;
     const allClusters = clusterPoints(zx);
 
+    // Stem heights are scaled against ALL clusters, not just visible ones,
+    // so they don't jump around while panning as big clusters enter and
+    // leave the view.
     const heightScale = computeHeightScale(allClusters);
 
+    // With ~54,000 entries, drawing every cluster — including the ones far
+    // off-screen at deep zoom — would mean thousands of pointless DOM
+    // nodes per frame. Keep only clusters inside the visible window (plus
+    // the clip padding), and single estimated entries whose range bar
+    // reaches into view even though their midpoint doesn't.
     const toX = linearX(zx);
     const viewLeft = -CLIP_PAD_X - 20;
     const viewRight = innerWidth + CLIP_PAD_X + 20;
@@ -54715,6 +54875,15 @@ function build() {
     });
     annotateClusterYears(clusters);
 
+    // Full re-draw each call: cluster membership changes with zoom, so a
+    // stable per-datum key isn't meaningful here. Only the visible
+    // clusters are drawn (see above), which keeps this affordable.
+    //
+    // Wiping the DOM here can destroy whatever marker is currently being
+    // hovered, without ever firing a real mouseleave on it — leaving the
+    // tooltip stuck open indefinitely with stale data. Explicitly hide it
+    // before the rebuild; it'll reappear on its own from a fresh
+    // mouseenter if the pointer is still over a marker afterward.
     tooltipEl.style.display = "none";
     markersG.selectAll("*").remove();
 
@@ -54743,6 +54912,7 @@ function build() {
         }
       });
 
+    // The range bar goes first so the stem and marker draw over it.
     groups.append("line").attr("class", "rangebar");
     groups.append("line").attr("class", "stem").attr("stroke-width", 1.5);
     groups
@@ -54764,6 +54934,15 @@ function build() {
       .attr("text-anchor", "middle")
       .attr("fill", "#FBFAF6");
 
+    // Only single (non-cluster) dots ever get a text label. A fixed
+    // dot-to-dot pixel gap isn't reliable here — two titles at the same
+    // spacing can render to very different widths (short vs. long
+    // concatenated titles), so a distance guess can pass while the actual
+    // text still overlaps. Instead, each label's width is measured off
+    // -DOM (see measureLabelWidth) before deciding, and it's only written
+    // into the DOM at all if it clears the previous shown label's real
+    // right edge — so overlap is impossible, and hidden labels cost
+    // nothing (no tspans ever get created for them).
     const LABEL_PAD = 8;
     let lastLabelRight = -Infinity;
 
@@ -54774,6 +54953,9 @@ function build() {
       const r = isCluster ? markerRadius(c.items.length, false) : 5;
       const color = clusterColor(c.items);
 
+      // A single estimated (range) entry: diamond at its midpoint plus a
+      // bar along the axis showing the full range. Clusters stay circles
+      // with a count — a bar per member would just be a smear.
       const single = !isCluster ? c.items[0] : null;
       const isRangeMarker = !!(single && single.isRange);
 
@@ -54842,11 +55024,16 @@ function build() {
   }
 
   function zoomToCluster(c) {
+    // A circle stands for a run of consecutive entries (by plot time).
+    // Frame exactly that run, so the view that opens holds those entries,
+    // the number on the circle, and not their neighbours.
     const items = c.items;
     const t0 = items[0].t;
     const t1 = items[items.length - 1].t;
     const [kMin, kMax] = zoomBehavior.scaleExtent();
 
+    // The entries just before and just after the run (it is contiguous in
+    // activeData), so the margin around it can be kept from reaching them.
     let lo = 0, hi = activeData.length;
     while (lo < hi) {
       const m = (lo + hi) >> 1;
@@ -54857,6 +55044,8 @@ function build() {
     const prev = found ? activeData[lo - 1] : undefined;
     const next = found ? activeData[lo + items.length] : undefined;
 
+    // A small margin so the first and last entries don't sit on the edge,
+    // never more than half way to the neighbouring entry.
     const span = t1 > t0 ? t1 - t0 : 1000 * 60 * 60 * 24;
     const edge = span * 0.03;
     const from = t0 - (prev ? Math.min(edge, (t0 - prev.t) / 2) : edge);
@@ -54866,6 +55055,11 @@ function build() {
     const x1 = xScale(new Date(to));
     const fitK = innerWidth / (x1 - x0);
 
+    // Normally framing the run already breaks it into several circles. If it
+    // doesn't (one unbroken dense stretch, or one circle that still holds
+    // most of the events, like 714 of 717), zoom in just far enough for it
+    // to split properly, using the same grouping the chart draws with, and
+    // centre on its widest gap so both sides are in view.
     const toX1 = linearX(xScale); // time -> pixel at zoom 1
     const splits = (z) => {
       const parts = groupRanges(items, (t) => toX1(t) * z);
@@ -54900,6 +55094,8 @@ function build() {
   }
 
   function showTooltip(c, event) {
+    // Sorted on hover only (not for every cluster on every render) — a
+    // cluster can hold thousands of entries.
     const items = c.items.length === 1
       ? c.items
       : c.items.slice().sort((a, b) => a.date - b.date);
@@ -54932,11 +55128,20 @@ function build() {
     tooltipEl.style.top = top + "px";
   }
 
+  // ---- zoom behavior (created before the brush: the brush's initial
+  // .move call below fires "brush end" synchronously, and that handler
+  // references zoomBehavior — and also before the very first render,
+  // since clusterPoints reads zoomBehavior.scaleExtent()) ----
   zoomBehavior = d3.zoom()
     .scaleExtent([1, 200000])
     .translateExtent([[0, 0], [innerWidth, innerHeight]])
     .extent([[0, 0], [innerWidth, innerHeight]])
     .interpolate(d3.interpolate) // straight line from start to end scale — the
+    // default (d3.interpolateZoom) does a cinematic "zoom out, pan, zoom in"
+    // swoop, which visually dips to LESS separation mid-transition even when
+    // drilling into a cluster — the opposite of what that click should feel
+    // like, and part of what made "current zoom" unreliable to sample
+    // mid-animation in the first place.
     .on("zoom", zoomed);
 
   main.call(zoomBehavior);
@@ -54944,6 +55149,13 @@ function build() {
   renderAxis(xScale);
   renderMarkers(xScale);
 
+  // A continuous zoom/pan gesture (scroll-wheel, drag) can fire many more
+  // raw "zoom" events than there are animation frames to draw them in —
+  // rebuilding the full marker DOM on every single one is far more work
+  // than the browser can actually show, and was the main cause of the
+  // "page is slowing down" warning. Coalescing to one render per frame
+  // (using only the LATEST transform each time) fixes that without
+  // changing what ends up on screen.
   let pendingZx = null;
   let renderScheduled = false;
   function scheduleFullRender(zx) {
@@ -54960,6 +55172,14 @@ function build() {
 
   function zoomed(event) {
     currentTransform = event.transform;
+    // Real user gestures (wheel, drag, touch) carry a sourceEvent;
+    // programmatic transitions we started ourselves (including every
+    // tick of their swoop interpolation) don't. Only trust the live
+    // value as "the target" when a person's hand is actually on it —
+    // our own transitions already set targetTransform explicitly the
+    // moment they're kicked off, and re-syncing it here from their
+    // mid-flight ticks would reintroduce the exact swoop bug this is
+    // meant to prevent.
     if (event.sourceEvent) targetTransform = event.transform;
     const zx = event.transform.rescaleX(xScale);
     currentXScale = zx;
@@ -54967,6 +55187,10 @@ function build() {
 
     if (!suppressZoom) {
       let [x0, x1] = zx.range().map(r => xScale(zx.invert(r)));
+      // At very deep zoom, the true visible range can be a fraction of a
+      // pixel wide on the overview strip. Rather than let it collapse to
+      // a hairline (which reads as "off" from whatever it's near), widen
+      // it to a minimum on-screen size, centered on the real midpoint.
       const MIN_BRUSH_PX = 6;
       if (x1 - x0 < MIN_BRUSH_PX) {
         const mid = (x0 + x1) / 2;
@@ -54979,6 +55203,7 @@ function build() {
     }
   }
 
+  // ---- overview / brush strip ----
   const overviewG = svg.append("g")
     .attr("transform", `translate(${MARGIN.left},${HEIGHT + OVERVIEW_MARGIN_TOP})`);
 
@@ -54986,6 +55211,13 @@ function build() {
     .attr("width", innerWidth).attr("height", OVERVIEW_HEIGHT)
     .attr("fill", "#F1EFE8").attr("rx", 4);
 
+  // One bar per pixel column instead of one circle per entry: ~54,000
+  // circles would make this strip alone heavy. Each column's shade shows
+  // how many entries fall there (log-scaled, so a few dense spots don't
+  // wash out everything else) and its color follows the Ms/Ts mix, using
+  // the same rule as the main markers. Reads activeData, so it follows
+  // the exact/estimated filter; it lives in its own group, created before
+  // the brush, so redrawing it never ends up on top of the brush.
   const ticksG = overviewG.append("g").attr("class", "ticks");
 
   function drawOverviewTicks() {
@@ -55014,6 +55246,9 @@ function build() {
   }
   drawOverviewTicks();
 
+  // The checkboxes (created once, outside build()) call this hook; it's
+  // re-pointed at the current build's renderers each time build() runs,
+  // so it stays valid after a window resize rebuilds everything.
   onFilterChange = () => {
     drawOverviewTicks();
     renderMarkers(currentXScale);
@@ -55043,6 +55278,13 @@ function build() {
     suppressZoom = false;
   }
 
+  // Computes a new transform scaled by `factor` around the viewport's
+  // center — same anchor behavior d3's scaleBy uses by default — but
+  // based on targetTransform (the intended destination) rather than the
+  // live transform, for the same reason zoomToCluster does: clicking a
+  // zoom button while a previous transition is still mid-swoop would
+  // otherwise scale from whatever momentarily-wrong value that swoop is
+  // passing through, not from where the view actually is/is heading.
   function scaleAroundCenter(factor) {
     const oldK = targetTransform.k;
     const oldX = targetTransform.x;
