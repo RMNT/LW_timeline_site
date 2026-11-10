@@ -54327,8 +54327,8 @@ const DATA = RAW_DATA
     const date = parseISODate(d.date);
     const endDate = d.end ? parseISODate(d.end) : null;
     const isRange = !!endDate && endDate > date;
-    const mid = isRange ? new Date((date.getTime() + endDate.getTime()) / 2) : date;
-    return { ...d, date, endDate: isRange ? endDate : null, isRange, mid };
+    const mid = date;
+    return { ...d, date, endDate: isRange ? endDate : null, isRange, mid, source: d.title.split(",")[0] };
   })
   .sort((a, b) => a.mid - b.mid);
 
@@ -54338,10 +54338,15 @@ DATA.forEach((d) => {
   if (!dateGroups.has(key)) dateGroups.set(key, []);
   dateGroups.get(key).push(d);
 });
-dateGroups.forEach((group) => {
+const dateKeys = [...dateGroups.keys()].sort((a, b) => a - b);
+dateKeys.forEach((key, idx) => {
+  const group = dateGroups.get(key);
   group.sort((a, b) => a.title.localeCompare(b.title, "en", { numeric: true }));
+
+  const nextKey = idx + 1 < dateKeys.length ? dateKeys[idx + 1] : Infinity;
+  const step = Math.min(1000 * 60 * 60 * 4, (nextKey - key) / group.length);
   group.forEach((d, i) => {
-    d.plotDate = new Date(d.mid.getTime() + i * 1000 * 60 * 60 * 4);
+    d.plotDate = new Date(key + i * step);
     d.t = d.plotDate.getTime();
   });
 });
@@ -54386,6 +54391,7 @@ const OVERVIEW_HEIGHT = 46;
 const OVERVIEW_MARGIN_TOP = 14;
 const CLUSTER_PX = 5;
 const MARKER_PAD = 3;
+const GROUP_MAX_PX = 40;
 const CLIP_PAD_X = 70;
 const CLIP_PAD_Y = 90;
 
@@ -54540,21 +54546,31 @@ function markerRadius(count, isRange) {
   return count > 1 ? Math.min(6 + Math.sqrt(count) * 2, 15) : (isRange ? 7 : 5);
 }
 
-function groupRanges(list, toX) {
+function groupRanges(list, toX, viewLeft = -Infinity) {
   const groups = [];
   let cur = null;
   for (let i = 0; i < list.length; i++) {
     const x = toX(list[i].t);
-    if (cur && x - cur.lastX <= CLUSTER_PX) {
+    if (cur && x - cur.lastX <= CLUSTER_PX && x - cur.firstX < GROUP_MAX_PX) {
       cur.hi = i + 1;
       cur.lastX = x;
-      cur.sumX += x;
     } else {
-      cur = { lo: i, hi: i + 1, lastX: x, sumX: x };
+      cur = { lo: i, hi: i + 1, firstX: x, lastX: x };
       groups.push(cur);
     }
   }
-  for (const g of groups) g.x = g.sumX / (g.hi - g.lo);
+
+  const place = (g) => {
+    let x = g.firstX;
+    if (x < viewLeft && g.hi - g.lo > 1) {
+      for (let i = g.lo; i < g.hi; i++) {
+        const xi = toX(list[i].t);
+        if (xi >= viewLeft) { x = xi; break; }
+      }
+    }
+    g.x = x;
+  };
+  groups.forEach(place);
 
   const radius = (g) => markerRadius(g.hi - g.lo, list[g.lo].isRange);
   const out = [];
@@ -54562,8 +54578,8 @@ function groupRanges(list, toX) {
     while (out.length) {
       const prev = out[out.length - 1];
       if (g.x - prev.x >= radius(prev) + radius(g) + MARKER_PAD) break;
-      const sumX = prev.sumX + g.sumX;
-      g = { lo: prev.lo, hi: g.hi, sumX, x: sumX / (g.hi - prev.lo) };
+      g = { lo: prev.lo, hi: g.hi, firstX: prev.firstX, lastX: g.lastX };
+      place(g);
       out.pop();
     }
     out.push(g);
@@ -54572,8 +54588,9 @@ function groupRanges(list, toX) {
 }
 
 function clusterPoints(zx) {
-  const grouped = groupRanges(activeData, linearX(zx)).map((g) => ({
+  const grouped = groupRanges(activeData, linearX(zx), 0).map((g) => ({
     x: g.x,
+    startX: g.firstX,
     items: activeData.slice(g.lo, g.hi),
   }));
 
@@ -54606,10 +54623,10 @@ function annotateClusterSpans(clusters) {
   clusters.forEach((c) => {
     let minT = Infinity, maxT = -Infinity;
     for (const d of c.items) {
-      const s = d.date.getTime();
-      const e = d.endDate ? d.endDate.getTime() : s;
-      if (s < minT) minT = s;
-      if (e > maxT) maxT = e;
+      const st = d.date.getTime();
+      const en = d.endDate ? d.endDate.getTime() : st;
+      if (st < minT) minT = st;
+      if (en > maxT) maxT = en;
     }
     c.minT = minT;
     c.maxT = maxT;
@@ -54697,9 +54714,15 @@ function build() {
     }
   }
 
+  const naturalOrder = new Intl.Collator("en", { numeric: true }).compare;
+  let lastClusters = [];
+  let circlesPerSource = null;
+
   function renderMarkers(zx) {
     const baselineY = innerHeight - AXIS_GUTTER;
     const allClusters = clusterPoints(zx);
+    lastClusters = allClusters;
+    circlesPerSource = null;
 
     const heightScale = computeHeightScale(allClusters);
 
@@ -54729,12 +54752,19 @@ function build() {
       .on("mouseenter", function (event, c) {
         d3.select(this).raise();
         showTooltip(c, event);
+        if (c.items.length > 1) {
+          d3.select(this).select("line.rangebar")
+            .attr("x1", toX(c.minT) - c.x).attr("x2", toX(c.maxT) - c.x)
+            .attr("y1", baselineY - 3).attr("y2", baselineY - 3)
+            .attr("stroke", clusterColor(c.items)).attr("stroke-width", 5).attr("opacity", 0.45);
+        }
       })
       .on("mousemove", function (event) {
         positionTooltip(event);
       })
-      .on("mouseleave", function () {
+      .on("mouseleave", function (event, c) {
         tooltipEl.style.display = "none";
+        if (c.items.length > 1) d3.select(this).select("line.rangebar").attr("opacity", 0);
       })
       .on("click", function (event, c) {
         if (c.items.length > 1) {
@@ -54860,37 +54890,32 @@ function build() {
 
     const span = t1 > t0 ? t1 - t0 : 1000 * 60 * 60 * 24;
     const edge = span * 0.03;
-    const from = t0 - (prev ? Math.min(edge, (t0 - prev.t) / 2) : edge);
-    const to = t1 + (next ? Math.min(edge, (next.t - t1) / 2) : edge);
-
-    const x0 = xScale(new Date(from));
-    const x1 = xScale(new Date(to));
-    const fitK = innerWidth / (x1 - x0);
+    const from = t0 - (prev ? Math.max(0, Math.min(edge, (t0 - prev.t) / 2)) : edge);
+    const to = t1 + (next ? Math.max(0, Math.min(edge, (next.t - t1) / 2)) : edge);
 
     const toX1 = linearX(xScale);
     const splits = (z) => {
       const parts = groupRanges(items, (t) => toX1(t) * z);
-      return parts.length >= 2 && Math.max(...parts.map((q) => q.hi - q.lo)) < items.length * 0.8;
+      return parts.length >= 2 && Math.max(...parts.map((q) => q.hi - q.lo)) < items.length * 0.5;
     };
 
-    let k = fitK, centerT = (from + to) / 2;
+    let k = Math.min(Math.max(innerWidth / (xScale(new Date(to)) - xScale(new Date(from))), kMin), kMax);
+    let centerT = (from + to) / 2;
+
     if (!splits(k)) {
-      let lo = k, hi = k * 1.5;
-      while (!splits(hi) && hi < kMax) { lo = hi; hi *= 1.5; }
-      hi = Math.min(hi, kMax);
+      let lo2 = k, hi2 = k * 1.5;
+      while (!splits(hi2) && hi2 < kMax) { lo2 = hi2; hi2 *= 1.5; }
+      hi2 = Math.min(hi2, kMax);
       for (let i = 0; i < 12; i++) {
-        const mid = (lo + hi) / 2;
-        if (splits(mid)) hi = mid; else lo = mid;
+        const mid = (lo2 + hi2) / 2;
+        if (splits(mid)) hi2 = mid; else lo2 = mid;
       }
-      k = hi;
-      let maxGap = 0;
-      centerT = (t0 + t1) / 2;
-      for (let i = 1; i < items.length; i++) {
-        const g = items[i].t - items[i - 1].t;
-        if (g > maxGap) { maxGap = g; centerT = (items[i].t + items[i - 1].t) / 2; }
-      }
+      k = hi2;
+      const parts = groupRanges(items, (t) => toX1(t) * k);
+      let busiest = parts[0];
+      for (const q of parts) if (q.hi - q.lo > busiest.hi - busiest.lo) busiest = q;
+      centerT = (items[busiest.lo].t + items[busiest.hi - 1].t) / 2;
     }
-    k = Math.min(Math.max(k, kMin), kMax);
 
     const tx = innerWidth / 2 - xScale(new Date(centerT)) * k;
     const transform = d3.zoomIdentity.translate(tx, 0).scale(k);
@@ -54909,21 +54934,63 @@ function build() {
     } else {
       const counts = new Map();
       for (const d of c.items) {
-        const source = d.title.split(",")[0];
-        counts.set(source, (counts.get(source) || 0) + 1);
+        const source = d.source;
+        let e = counts.get(source);
+        if (!e) { e = { n: 0, rs: Infinity, re: -Infinity, first: null, last: null }; counts.set(source, e); }
+        e.n++;
+        if (d.isRange) {
+          if (d.date.getTime() < e.rs) e.rs = d.date.getTime();
+          if (d.endDate.getTime() > e.re) e.re = d.endDate.getTime();
+        }
       }
-      const sources = [...counts.keys()].sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
+      if (!circlesPerSource) {
+        circlesPerSource = new Map();
+        for (const cl of lastClusters) {
+          const seen = new Set();
+          for (const d of cl.items) seen.add(d.source);
+          for (const src of seen) circlesPerSource.set(src, (circlesPerSource.get(src) || 0) + 1);
+        }
+      }
+      const byNumber = naturalOrder;
+      const brief = (n) => {
+        const p = n.split("]et");
+        const out = p.length > 2 ? `${p[0]}]et\u2026et${p[p.length - 1]}` : n;
+        return out.length > 24 ? out.slice(0, 23) + "\u2026" : out;
+      };
+      for (const d of c.items) {
+        const source = d.source;
+        if ((circlesPerSource.get(source) || 0) < 2) continue;
+        const num = d.title.slice(source.length + 1);
+        if (!num) continue;
+        const e = counts.get(source);
+        if (e.first === null || byNumber(num, e.first) < 0) e.first = num;
+        if (e.last === null || byNumber(num, e.last) > 0) e.last = num;
+      }
+      const sources = [...counts.keys()].sort(byNumber);
+      const hasNums = sources.some((src) => counts.get(src).first !== null);
+      const hasEst = sources.some((src) => counts.get(src).re > -Infinity);
       const cardRect = card.getBoundingClientRect();
-      const maxCols = Math.max(1, Math.floor((cardRect.width - 24) / 112));
+      const maxCols = Math.max(1, Math.floor((cardRect.width - 24) / (112 + (hasEst ? 103 : 0) + (hasNums ? 100 : 0))));
       const cols = Math.min(maxCols, Math.max(1, Math.ceil(sources.length / 12)));
       const rows = Math.ceil(sources.length / cols);
-      const span = formatEntryDate({ isRange: c.maxT > c.minT, date: new Date(c.minT), endDate: new Date(c.maxT) });
+      const sameDay = new Date(c.minT).toDateString() === new Date(c.maxT).toDateString();
+      const span = formatEntryDate({ isRange: !sameDay, date: new Date(c.minT), endDate: new Date(c.maxT) });
       const list = sources
-        .map((src) => `<div>${src} <span style="opacity:.6">(${counts.get(src)})</span></div>`)
+        .map((src) => {
+          const e = counts.get(src);
+          const est = e.re > -Infinity
+            ? ` <span style="opacity:.6;white-space:normal">\u00b7 est. ${formatEntryDate({ isRange: true, date: new Date(e.rs), endDate: new Date(e.re) })}</span>`
+            : "";
+          const nums = e.first !== null
+            ? ` <span style="opacity:.6">\u00b7 ${e.first === e.last ? brief(e.first) : brief(e.first) + " \u2013 " + brief(e.last)}</span>`
+            : "";
+          return `<div>${src} <span style="opacity:.6">(${e.n})</span>${nums}${est}</div>`;
+        })
         .join("");
-      if (cols > 1) tooltipEl.style.maxWidth = cardRect.width - 12 + "px";
+      tooltipEl.style.maxWidth = cardRect.width - 12 + "px";
+      const startsLeft = c.x - c.startX > 1 ? " \u00b7 starts left of this view" : "";
       tooltipEl.innerHTML =
-        `<div class="tt-date">${span} \u00b7 ${c.items.length} entries \u00b7 ${sources.length} Ms/Ts</div>` +
+        `<div class="tt-date">${span} \u00b7 ${c.items.length} entries \u00b7 ${sources.length} Ms/Ts${startsLeft}</div>` +
         `<div style="display:grid;grid-auto-flow:column;grid-template-rows:repeat(${rows},auto);column-gap:14px;white-space:nowrap">${list}</div>`;
     }
     tooltipEl.style.display = "block";
